@@ -3,11 +3,11 @@
 Listens on ``/voice`` for one bidirectional PCM16 stream from the Veris actor.
 Smallest ships the three legs of a voice agent as separate products rather
 than one session, so this process *is* the pipeline: Pulse transcribes the
-caller over a WebSocket, Electron — Smallest's OpenAI-compatible chat model —
-reasons over the transcript and calls Rory's 16 tools, and Lightning speaks
-the reply back over a second WebSocket, one connection per utterance.
-Turn-taking, barge-in and conversation state live here — no vendor holds the
-session. One API key (``SMALLEST_API_KEY``) covers all three legs.
+caller over a WebSocket, a chat model (``gpt-4.1-mini`` by default, or
+Smallest's own Electron) reasons over the transcript and calls Rory's 16
+tools, and Lightning speaks the reply back over a second WebSocket, one
+connection per utterance. Turn-taking, barge-in and conversation state live
+here — no vendor holds the session.
 
 Everything below the transport is shared with the other agents — same prompt,
 same greeting, same frozen-clock date context, same tools, same dispatcher. The
@@ -40,7 +40,16 @@ from rory_tools.vad import SileroVad
 
 from .tools import TOOLS
 
-LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "electron")
+# model → (base URL, credential env). The chat model is ``gpt-4.1-mini`` by
+# default, the model the other cascades run, so the vendor legs are what
+# differs; ``SMALLEST_LLM_MODEL=electron`` swaps in Smallest's own model,
+# making the same image a second candidate.
+LLMS = {
+    "gpt-4.1-mini": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "electron": ("https://api.smallest.ai/waves/v1", "SMALLEST_API_KEY"),
+}
+LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "gpt-4.1-mini")
+LLM_BASE_URL, LLM_KEY_ENV = LLMS[LLM_MODEL]
 # The Pro pool: broadcast-quality voices, dedicated inference capacity, no
 # cloning. Pro is picky about voice/model pairing — confirmed live, a
 # standard-pool voice like "sophia" on this model is rejected outright by the
@@ -50,8 +59,6 @@ LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "electron")
 TTS_MODEL = os.environ.get("SMALLEST_TTS_MODEL", "lightning_v3.1_pro")
 VOICE = os.environ.get("SMALLEST_VOICE", "kelsey")
 LANGUAGE = os.environ.get("SMALLEST_LANGUAGE", "en")
-
-LLM_BASE_URL = "https://api.smallest.ai/waves/v1"
 
 # The Veris actor speaks and listens at 24 kHz PCM16. Pulse's live endpoint
 # accepts 8000/16000/22050/24000/44100/48000 Hz and Lightning can be asked for
@@ -86,26 +93,26 @@ TTS_URL = "wss://api.smallest.ai/waves/v1/tts/live"
 # not arrive at a steady rate, and a wall-clock timer would endpoint mid-burst.
 END_OF_TURN_S = 0.8
 
-# Pulse finalizes on trailing silence, on word count, and on a client-sent
-# `finalize` message — so a turn can already be closed by the time our own
-# silence timer fires. How long to wait for Pulse to acknowledge our request
-# (another `is_final` transcript event) before giving up and using whatever
-# text has arrived so far, rather than stalling the call.
-FINALIZE_TIMEOUT_S = 1.5
-
 # Whether the caller is speaking comes from Silero VAD (rory_tools.vad), not
 # frame energy: the bench mixes cafe and television audio under the caller,
 # and an energy gate hears that as a caller who never stops talking.
 
-# How long a word of the reply takes Lightning to say — a nominal estimate,
-# not a measured one (unlike the Mistral and xAI cascades' TTS_MS_PER_WORD,
-# this has not been benchmarked against the deployed voice). Needed because a
-# barge-in cancels the TTS connection mid-reply, and Lightning's `chunk`
-# frames carry no text alignment of their own. Lightning's WebSocket supports
-# `word_timestamps` for English/Hindi voices, which would replace this
-# estimate with an exact cut — worth adding once this transport has a
-# benchmarked voice to measure against.
-TTS_MS_PER_WORD = 350
+# How long a word of the reply takes Lightning to say, measured on `kelsey`
+# (338 ms/word over four replies, 288–381 each). Needed because a barge-in
+# cancels the TTS connection mid-reply, and Lightning's `chunk` frames carry no
+# text alignment of their own, so the cut turns audio sent into words.
+TTS_MS_PER_WORD = 340
+
+# Lightning streams a reply faster than it plays, so sent as it lands the
+# whole reply sits in the actor's buffer within a second or two and a
+# barge-in has nothing left to cut. Replies go out in slices this long, paced
+# against playback, as in the xAI and Hugging Face cascades.
+PLAYBACK_CHUNK_BYTES = 500 * PCM16_BYTES_PER_MS
+
+# How far ahead of real-time playback the pacer is allowed to run. One slice
+# in the actor's buffer keeps the line gapless; more just widens the slice of
+# already-delivered audio barge-in can't claw back.
+PLAYBACK_LEAD_S = 1.0
 
 # Appended to a reply the caller talked over, in place of the words that were
 # never sent, so the model reads its own history as cut off rather than said.
@@ -127,9 +134,9 @@ def _auth_headers() -> dict[str, str]:
 
 
 async def resolve_vendor() -> None:
-    """Build the shared Electron client once per process, after the credential check."""
+    """Build the shared chat client once per process, after the credential check."""
     global _llm
-    _llm = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=os.environ["SMALLEST_API_KEY"])
+    _llm = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=os.environ[LLM_KEY_ENV])
     logger.info(f"[startup] stt=pulse llm={LLM_MODEL} tts={TTS_MODEL} voice={VOICE}")
 
 
@@ -173,11 +180,9 @@ class _Call:
         self._voiced = False               # caller is mid-utterance
         self._silence_s = 0.0              # audio seconds since the last voiced frame
         self._vad = SileroVad(ACTOR_RATE_HZ)
-        self._latest_transcript = ""       # most recent non-empty `is_final` transcript
-        self._finalize_ack = asyncio.Event()
+        self._segments: list[str] = []     # `is_final` texts of the turn in progress
         self._turns: asyncio.Queue[str] = asyncio.Queue()
         self._speaking: asyncio.Task | None = None
-        self._endpointing: asyncio.Task | None = None  # in-flight _endpoint(), if any
         self._sent_bytes = 0  # PCM16 of the in-flight reply handed to the actor
 
     async def run(self) -> None:
@@ -197,9 +202,6 @@ class _Call:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            if self._endpointing is not None and not self._endpointing.done():
-                self._endpointing.cancel()
-                tasks.append(self._endpointing)
             await asyncio.gather(*tasks, return_exceptions=True)
             await self._stt.close()
 
@@ -229,26 +231,7 @@ class _Call:
                 elif self._voiced:
                     self._silence_s += len(frame) / 2 / ACTOR_RATE_HZ
                     if self._silence_s >= END_OF_TURN_S:
-                        # Fire-and-forget: Smallest's own reference client sends
-                        # audio and reads responses as two independent tasks and
-                        # never pauses the sender to wait on one — awaiting
-                        # _endpoint() inline here would stall this loop (and with
-                        # it, Pulse ingestion and barge-in detection) for up to
-                        # FINALIZE_TIMEOUT_S on every single turn. Reset the
-                        # state that guards re-entry now, synchronously, so a
-                        # later silent frame can't schedule a second endpoint
-                        # before this one has even started running.
-                        self._voiced = False
-                        self._silence_s = 0.0
-                        if self._endpointing is None or self._endpointing.done():
-                            self._endpointing = asyncio.create_task(self._endpoint())
-                        # else: a finalize is already in flight (the caller
-                        # paused, resumed, and paused again before it resolved).
-                        # Two concurrent _endpoint() calls would both wait on
-                        # the same _finalize_ack and could both fire on one
-                        # ack — the pending one already picks up whatever
-                        # _latest_transcript holds once it resolves, so a
-                        # second is never needed.
+                        await self._endpoint()
 
                 await self._stt.send(frame)
         except WebSocketDisconnect as exc:
@@ -277,63 +260,43 @@ class _Call:
             self._speaking.cancel()
 
     async def _endpoint(self) -> None:
-        """The caller has stopped: ask Pulse to finalize and collect the turn's text.
+        """The caller has stopped: ask Pulse to finalize the turn.
 
-        Runs as its own task, not awaited inline by the audio pump — Smallest's
-        own reference client keeps sending audio on a task independent of the
-        one reading responses, and never blocks the sender on a reply. Pulse
-        also keeps the session open across a finalize, so there is nothing to
-        pause audio for regardless.
-
-        Pulse may already have finalized part of the utterance on its own
-        (trailing silence or word count) before this fires; that is fine
-        because ``_latest_transcript`` always holds the full utterance restated
-        so far, not a fragment to append to — see ``_pump_stt_events``.
+        Nothing waits here for the answer — the pump goes straight back to
+        forwarding audio, and ``_pump_stt_events`` dispatches the turn when
+        Pulse's ``from_finalize`` final arrives.
         """
         logger.info("[turn] endpoint — finalizing")
-        self._finalize_ack.clear()
+        self._voiced = False
+        self._silence_s = 0.0
         await self._stt.send(json.dumps({"type": "finalize"}))
-        try:
-            await asyncio.wait_for(self._finalize_ack.wait(), timeout=FINALIZE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[stt] finalize not acknowledged within {FINALIZE_TIMEOUT_S}s — "
-                "using the transcript collected so far"
-            )
-
-        text = self._latest_transcript.strip()
-        self._latest_transcript = ""
-        logger.info(f"[stt] caller_said: {text}")
-        if text:
-            await self._turns.put(text)
 
     async def _pump_stt_events(self) -> None:
-        """Transcription events → the turn-in-progress text.
+        """Transcription events → turn text.
 
-        Verified live (2026-10-14, looping Lightning's own TTS output back
-        into Pulse): an ``is_final`` transcript is the *complete* utterance
-        restated so far, not a new fragment since the previous final — so each
-        one overwrites ``_latest_transcript`` rather than extending it.
-        Overwriting, not appending, also means a later empty-text final (as
-        Pulse sends to acknowledge ``close_stream``) cannot blank out text a
-        real final already captured. ``_endpoint`` is the only place that
-        turns this into a dispatched turn. Interim (``is_final: false``)
-        events are not acted on; they exist for live captions, which this
-        transport does not render.
+        Verified live (2026-10-14, Lightning's own TTS looped into Pulse): an
+        ``is_final`` transcript covers only the audio since the previous final.
+        Pulse finalizes on its own at short pauses, so a caller who reads an
+        account number, pauses half a second and gives a postcode arrives as
+        two finals inside one turn — the turn is their concatenation. The final
+        answering our ``finalize`` carries ``from_finalize: true`` (with
+        whatever text was still pending, often none) and is what closes the
+        turn. Interim (``is_final: false``) events are not acted on; they
+        exist for live captions, which this transport does not render.
         """
         async for raw in self._stt:
-            try:
-                data = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                logger.warning(f"[stt] non-JSON message: {raw!r}")
+            data = json.loads(raw)
+            if not data.get("is_final"):
                 continue
-
-            is_final = bool(data.get("is_final"))
-            text = (data.get("transcript") or "").strip()
-            if is_final:
-                if text:
-                    self._latest_transcript = text
-                self._finalize_ack.set()
+            text = data["transcript"].strip()
+            if text:
+                self._segments.append(text)
+            if data.get("from_finalize"):
+                turn = " ".join(self._segments)
+                self._segments.clear()
+                logger.info(f"[stt] caller_said: {turn}")
+                if turn:
+                    await self._turns.put(turn)
 
         raise RuntimeError("Pulse STT closed the stream")
 
@@ -346,13 +309,19 @@ class _Call:
         """
         # Rory speaks first. Spoken straight through TTS rather than asked of
         # the LLM, as Pipecat does, so the opening words are verbatim and the
-        # first turn costs no completion. Seeded as the first assistant turn so
-        # the model knows it has already greeted and doesn't repeat it, and
-        # seeded before it is spoken, like every reply, so a caller talking
-        # over it trims it too.
+        # first turn costs no completion. Recorded as the first assistant turn
+        # so the model knows it has already greeted and doesn't repeat it.
+        #
+        # The greeting is not interruptible, as in the xAI cascade. The bench's
+        # background noise starts with the call, and on the first smoke run
+        # Silero fired 0.15–0.3 s in and cancelled the greeting before any
+        # audio went out: the caller heard silence and hung up after 30 s. It
+        # is spoken by ``_speak_now`` directly, so ``_speaking`` stays unset and
+        # ``_on_voice`` has nothing to cancel. A caller who does talk over it
+        # has their turn taken right after.
         logger.info("[turn] speaking greeting (agent greets first)")
+        await self._speak_now(GREETING)
         self.messages.append({"role": "assistant", "content": GREETING})
-        await self._speak(GREETING)
 
         while True:
             text = await self._turns.get()
@@ -448,8 +417,8 @@ class _Call:
         messages carry no sentence boundaries, so the cut is proportional over
         the reply's words: the PCM sent to the actor, in ms, against the
         reply's length at TTS_MS_PER_WORD. Bytes handed to the actor count as
-        heard; the connection is unpaced, so that is an upper bound on what
-        was played.
+        heard; the pacer runs at most PLAYBACK_LEAD_S ahead, so that
+        overstates it by no more.
         """
         if self._sent_bytes == 0:
             self.messages.pop()
@@ -473,9 +442,21 @@ class _Call:
         a barge-in cancelling this coroutine simply closes the connection
         (the ``async with`` below) rather than leaving stale audio for the next
         reply to collide with.
+
+        The first slice goes out as soon as it lands, so the actor hears the
+        reply onset immediately; after that slices go out no more than
+        PLAYBACK_LEAD_S ahead of real-time playback, and cancelling this task
+        strands the rest unsent.
         """
         t0 = time.monotonic()
-        async with websockets.connect(TTS_URL, additional_headers=_auth_headers()) as ws:
+        # close_timeout=0: Lightning does not answer a close frame while it is
+        # still streaming, so a barge-in's close waited out the default 10 s
+        # handshake timeout — ten seconds of dead air before the caller's turn
+        # (8 of 27 barge-ins on the second VAmoS smoke run). The utterance is
+        # being abandoned; there is nothing to wait for.
+        async with websockets.connect(
+            TTS_URL, additional_headers=_auth_headers(), close_timeout=0
+        ) as ws:
             await ws.send(json.dumps({
                 "text": text,
                 "voice_id": VOICE,
@@ -485,6 +466,7 @@ class _Call:
             }))
             n_chunks = 0
             n_bytes = 0
+            t_play = None  # playback clock, started at the first byte sent
             async for raw in ws:
                 msg = json.loads(raw)
                 status = msg.get("status")
@@ -496,14 +478,23 @@ class _Call:
                         logger.info(
                             f"[tts] first chunk after {time.monotonic() - t0:.2f}s ({len(pcm16)} bytes)"
                         )
-                    await self.actor_ws.send_bytes(pcm16)
-                    self._sent_bytes += len(pcm16)
+                        t_play = time.monotonic()
+                    for i in range(0, len(pcm16), PLAYBACK_CHUNK_BYTES):
+                        sent_s = self._sent_bytes / 2 / ACTOR_RATE_HZ
+                        ahead = sent_s - (time.monotonic() - t_play)
+                        if ahead > PLAYBACK_LEAD_S:
+                            await asyncio.sleep(ahead - PLAYBACK_LEAD_S)
+                        piece = pcm16[i : i + PLAYBACK_CHUNK_BYTES]
+                        await self.actor_ws.send_bytes(piece)
+                        self._sent_bytes += len(piece)
                 elif status == "complete":
                     break
                 elif status == "error":
                     raise RuntimeError(f"Lightning TTS error: {msg.get('error', msg)}")
                 else:
                     logger.warning(f"[tts] unknown message status: {msg}")
+            else:
+                raise RuntimeError("Lightning TTS closed the stream before `complete`")
             logger.info(
                 f"[tts] spoke {n_chunks} chunks ({n_bytes} bytes, "
                 f"{n_bytes / 2 / ACTOR_RATE_HZ:.1f}s audio) in {time.monotonic() - t0:.2f}s"

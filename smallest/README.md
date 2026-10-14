@@ -7,20 +7,24 @@ Smallest ships the three legs of a voice agent as separate products rather
 than one session, so this process is the pipeline:
 
 ```
-actor 24 kHz ─► Pulse STT ─► Electron (chat model) + Rory's tools ─► Lightning TTS ─► actor
+actor 24 kHz ─► Pulse STT ─► chat model + Rory's tools ─► Lightning TTS ─► actor
         └─► Silero VAD ─► barge-in: cancel the TTS connection
 ```
 
-One `SMALLEST_API_KEY` covers all three legs. Pulse's live endpoint and
+One `SMALLEST_API_KEY` covers Pulse and Lightning. The chat model is
+`gpt-4.1-mini` by default, the model the other cascades run, so the vendor legs
+are what differs; `SMALLEST_LLM_MODEL=electron` swaps in Smallest's own model
+(Electron needs a plan with LLM access). Pulse's live endpoint and
 Lightning both accept 24 kHz directly — the actor's own rate — so unlike the
 Mistral and Hugging Face cascades, no audio is resampled anywhere in this
 transport.
 
 | Env | Default |
 |---|---|
-| `SMALLEST_API_KEY` | required — Pulse, Electron and Lightning, boot fails without it |
+| `SMALLEST_API_KEY` | required — Pulse and Lightning (and Electron), boot fails without it |
+| `OPENAI_API_KEY` | required with the default `gpt-4.1-mini` |
 | `STRIPE_API_KEY` | required — sandbox fixture; the billing twin's credential |
-| `SMALLEST_LLM_MODEL` | `electron` |
+| `SMALLEST_LLM_MODEL` | `gpt-4.1-mini`, or `electron` |
 | `SMALLEST_TTS_MODEL` | `lightning_v3.1_pro` — the premium pool: broadcast-quality voices, dedicated inference capacity, no cloning |
 | `SMALLEST_VOICE` | `kelsey` — must be a voice in the Pro pool |
 | `SMALLEST_LANGUAGE` | `en` |
@@ -31,12 +35,13 @@ transport.
 held open for the whole call. Caller audio goes up unconverted; Pulse finalizes
 on its own trailing-silence and word-count thresholds as well as on a
 client-sent `{"type": "finalize"}`. Verified live (looping Lightning's own TTS
-output back into Pulse): each `is_final` event's `transcript` is the complete
-utterance restated so far, not a new fragment since the previous final, so the
-turn's text is the *latest* `is_final` transcript, not a concatenation of
-several — see `_endpoint` and `_pump_stt_events` in `agent.py`.
+output back into Pulse): each `is_final` transcript covers only the audio since
+the previous final, and Pulse finalizes on its own at a pause as short as
+0.6 s. A turn's text is therefore every final since the last turn, joined, and
+the turn closes when the final answering our `finalize` (`from_finalize: true`)
+arrives — see `_endpoint` and `_pump_stt_events` in `agent.py`.
 
-**LLM.** A non-streaming Electron chat completion per round, with Rory's tools
+**LLM.** A non-streaming chat completion per round, with Rory's tools
 registered in the standard OpenAI function-calling shape. Electron can also
 return a spoken filler alongside `tool_calls` when prompted for one, but this
 transport does not use that: the shared `agent_desc.txt` is loaded verbatim
@@ -49,8 +54,10 @@ asked for.
 Smallest's docs flag as deprecated) takes one utterance per connection — there
 is no documented way to abandon an utterance mid-stream and reuse the socket —
 so this transport opens a fresh connection per reply and closes it once
-Lightning reports `"status": "complete"`. Audio chunks are decoded and
-forwarded to the actor as they arrive.
+Lightning reports `"status": "complete"`; a connection that closes before it
+fails the call. Lightning streams faster than real time, so the audio goes to
+the actor in 500 ms slices paced at most 1 s ahead of playback, as in the xAI
+and Hugging Face cascades — otherwise a barge-in would have nothing left to cut.
 
 ## Turn-taking and barge-in
 
@@ -66,11 +73,8 @@ gives no per-word timing on the plain `chunk` stream, the interrupted reply is
 trimmed proportionally — PCM bytes sent to the actor, in ms, against the
 reply's word count at `TTS_MS_PER_WORD` — and the kept words are marked
 `… [interrupted by the caller]` in the model's history, so the next turn
-reasons from what the caller actually heard. `TTS_MS_PER_WORD` is a nominal
-estimate, not benchmarked against the deployed voice; Lightning's WebSocket
-supports exact `word_timestamps` for English and Hindi voices, which would
-replace the estimate with an exact cut and is worth adding once this
-transport has a benchmarked voice to measure against.
+reasons from what the caller actually heard. `TTS_MS_PER_WORD` (340) is
+measured on `kelsey`: 338 ms/word over four Rory replies.
 
 ## Files
 

@@ -94,7 +94,8 @@ def _wire(monkeypatch, actor: _Actor, *, n_chunks: int, barge_in_during_tts: boo
     async def complete(**kwargs):
         return SimpleNamespace(choices=[SimpleNamespace(message=reply)])
 
-    def connect(_url, **_kwargs):
+    def connect(_url, **kwargs):
+        call.tts_connect_kwargs = kwargs
         on_send = call._on_voice if barge_in_during_tts else None
         return _ConnectContext(_TTSConnection(n_chunks, on_send=on_send))
 
@@ -148,7 +149,7 @@ def test_barge_in_mid_reply_keeps_the_words_whose_audio_went_out(monkeypatch, lo
     ]
     assert call.messages[-1] == {"role": "assistant", "content": REPLY}
     assert [line for line in log_lines if "barge-in: trimmed" in line] == [
-        '[voice] barge-in: trimmed reply to 1750 ms / 4200 ms ("one two three four five")'
+        '[voice] barge-in: trimmed reply to 1700 ms / 4080 ms ("one two three four five")'
     ]
 
 
@@ -165,21 +166,69 @@ def test_barge_in_before_any_audio_drops_the_message(monkeypatch, log_lines):
     ]
 
 
-def test_greeting_is_on_the_history_before_it_is_spoken(monkeypatch):
-    # A caller talking over the greeting trims it like any reply, which needs
-    # it appended first.
+def test_greeting_is_not_cut_by_voice_activity(monkeypatch):
+    # Background noise at call start trips the VAD; the greeting plays in full.
     actor = _Actor(barge_in_after=1)
     call, _ = _wire(monkeypatch, actor, n_chunks=12)
+    monkeypatch.setattr(agent, "PLAYBACK_LEAD_S", float("inf"))
 
     async def greet_only():
         worker = asyncio.create_task(call._turn_worker())
-        while not actor.sent or call._speaking is not None:
+        while call.messages[-1]["role"] != "assistant":
             await asyncio.sleep(0)
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
 
     asyncio.run(greet_only())
 
-    assert call.messages[-1]["role"] == "assistant"
+    assert len(actor.sent) == 12
+    assert call.messages[-1] == {"role": "assistant", "content": agent.GREETING}
+
+
+def test_reply_audio_is_paced_so_barge_in_has_something_to_cut(monkeypatch):
+    """Lightning delivers the whole reply at once; the actor must not get it at once.
+
+    Twelve chunks (4.2 s of audio) land instantly. A caller who talks 0.2 s in
+    must stop the rest: at most PLAYBACK_LEAD_S ahead of playback went out.
+    """
+    actor = _Actor()
+    call, reply = _wire(monkeypatch, actor, n_chunks=12)
+
+    async def scenario():
+        call.messages.append({"role": "assistant", "content": REPLY})
+        speak = asyncio.create_task(call._speak(REPLY))
+        await asyncio.sleep(0.2)
+        call._on_voice()
+        await speak
+
+    asyncio.run(scenario())
+    sent_s = sum(len(c) for c in actor.sent) / agent.PCM16_BYTES_PER_MS / 1000
+    assert sent_s <= 0.2 + agent.PLAYBACK_LEAD_S + agent.TTS_MS_PER_WORD / 1000
     assert call.messages[-1]["content"].endswith(agent.INTERRUPTED_MARKER)
-    assert call.messages[-1]["content"] != agent.GREETING
+
+
+def test_lightning_closing_before_complete_fails_the_reply(monkeypatch):
+    """A socket that ends without `complete` is a truncated reply, not a spoken one."""
+    actor = _Actor()
+    call, _ = _wire(monkeypatch, actor, n_chunks=2)
+    monkeypatch.setattr(_TTSConnection, "__init__", _truncated_init)
+
+    with pytest.raises(RuntimeError, match="before `complete`"):
+        asyncio.run(call._speak_now(REPLY))
+
+
+def _truncated_init(self, n_chunks, on_send=None):
+    audio = base64.b64encode(bytes(CHUNK_BYTES)).decode()
+    self._messages = [json.dumps({"status": "chunk", "data": {"audio": audio}})] * n_chunks
+    self._on_send = on_send
+    self._sent_text = False
+
+
+def test_tts_connection_does_not_wait_on_the_close_handshake(monkeypatch):
+    """Lightning ignores a close frame mid-stream; waiting on it stalled barge-ins 10 s."""
+    actor = _Actor()
+    call, _ = _wire(monkeypatch, actor, n_chunks=1)
+
+    asyncio.run(call._speak_now(REPLY))
+
+    assert call.tts_connect_kwargs["close_timeout"] == 0
