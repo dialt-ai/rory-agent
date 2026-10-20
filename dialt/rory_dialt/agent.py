@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import audioop
 import json
+import logging
 import os
+import time
 import uuid
 from collections import defaultdict
 
@@ -18,6 +20,7 @@ import websockets
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from rory_tools import CallSession, dispatch
+from rory_tools.impl import UNVERIFIED
 from rory_tools.prompt import GREETING, load_agent_prompt, today_context
 
 from .tools import TOOLS
@@ -28,6 +31,8 @@ DIALT_VOICE = os.environ.get("DIALT_VOICE", "us_female")
 AGENT_PROMPT = load_agent_prompt()
 OUTPUT_BYTES_PER_MS = 48
 FRAME_BYTES = 960  # 20 ms of PCM16/24 kHz
+PLAYBACK_LEAD_S = 0.06
+logger = logging.getLogger("uvicorn.error")
 
 
 def validate_config() -> None:
@@ -62,8 +67,8 @@ class _Playback:
     """Pace output so an interruption can discard audio still owned here.
 
     voice_ws has no clear-buffer command or playback acknowledgements. Once
-    sent, a frame cannot be recalled; keep that tail to one 20 ms frame rather
-    than forwarding a whole faster-than-realtime reply to the actor at once.
+    sent, a frame cannot be recalled. Keep a 60 ms lead (plus the current
+    20 ms frame) to absorb send/scheduler jitter without queuing a whole reply.
     """
 
     def __init__(self, actor: WebSocket):
@@ -94,12 +99,22 @@ class _Playback:
         return discarded / OUTPUT_BYTES_PER_MS
 
     async def run(self) -> None:
+        started = None
+        sent_s = 0.0
         while True:
             response, audio = await self.queue.get()
             self.queued_bytes[response] -= len(audio)
             try:
+                now = time.monotonic()
+                # Reset after actual idle time, not merely an empty queue:
+                # the actor may still be playing the previous chunk's lead.
+                if started is None or now >= started + sent_s:
+                    started, sent_s = now, 0.0
                 await self.actor.send_bytes(audio)
-                await asyncio.sleep(len(audio) / 48000)
+                sent_s += len(audio) / 48000
+                ahead = sent_s - (time.monotonic() - started)
+                if ahead > PLAYBACK_LEAD_S:
+                    await asyncio.sleep(ahead - PLAYBACK_LEAD_S)
             finally:
                 self.queue.task_done()
 
@@ -144,7 +159,7 @@ async def _tools(ws, calls: asyncio.Queue, cancelled: set[str], session: CallSes
             # Only explicit negative results establish failure. Preserve the
             # shared result verbatim so the model still sees any refusal.
             outcome = "succeeded"
-            if result.get("verified") is False or result.get("paid") is False:
+            if result == UNVERIFIED or result.get("verified") is False or result.get("paid") is False:
                 outcome = "failed"
             elif "error" in result:
                 outcome = "unknown"
@@ -212,7 +227,7 @@ async def _downlink(ws, playback: _Playback, calls: asyncio.Queue, cancelled: se
                 # consumed. Finish those events and drain surviving audio.
                 pass
         elif kind == "error":
-            # Do not log raw server payloads, credentials or conversation data.
+            logger.warning("Dialt error code=%s retryable=%s", event.get("code"), event.get("retryable"))
             raise RuntimeError("Dialt reported a session error")
     # Normal closure preserves the last spoken reply. Abnormal socket closure
     # raises from the iterator and fails the call instead of hiding a dropout.
@@ -222,11 +237,13 @@ async def _downlink(ws, playback: _Playback, calls: asyncio.Queue, cancelled: se
 async def run_voice_ws_bot(actor_ws: WebSocket) -> None:
     headers = {"Authorization": f"Bearer {os.environ['DIALT_API_KEY']}"}
     async with websockets.connect(DIALT_URL, additional_headers=headers) as ws:
+        logger.info("Dialt provider connected tier=%s", DIALT_BRAIN)
         await ws.send(json.dumps(_start()))
         async with asyncio.timeout(15):
             while True:
                 event = json.loads(await ws.recv())
                 if event.get("type") == "error":
+                    logger.warning("Dialt startup error code=%s retryable=%s", event.get("code"), event.get("retryable"))
                     raise RuntimeError("Dialt rejected session startup")
                 if event.get("type") == "ready":
                     audio = event.get("audio", {})
@@ -235,6 +252,7 @@ async def run_voice_ws_bot(actor_ws: WebSocket) -> None:
                     suppression = event.get("background_speaker_suppression", {})
                     if suppression.get("enabled") is not False or suppression.get("agent_control") is not True:
                         raise RuntimeError("Dialt did not confirm the requested suppression settings")
+                    logger.info("Dialt session ready tier=%s suppression=false agent_control=true", DIALT_BRAIN)
                     break
 
         playback = _Playback(actor_ws)

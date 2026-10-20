@@ -10,7 +10,7 @@ per connection. No separate speech or language-model credentials are needed.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DIALT_API_KEY` | required | Backend Dialt API credential |
+| `DIALT_API_KEY` | required | Backend Dialt API credential authorized for the suppression beta |
 | `DIALT_BRAIN` | `fast` | `fast` = Dialt Fast; `smart` = Dialt Smart |
 | `DIALT_VOICE` | `us_female` | Stock voice key from Dialt's voice catalogue |
 | `STRIPE_API_KEY` | required | Shared Rory billing backend credential |
@@ -35,7 +35,9 @@ continuously to Dialt's 16 kHz and requests 24 kHz output, checking the server's
 `ready` format before sending microphone audio. The shared greeting starts
 the call. Server turn detection is used without an endpointing override.
 
-Output is paced in 20 ms slices. Hard interruptions discard locally queued
+Output is paced against a monotonic clock in 20 ms slices with a 60 ms lead
+to absorb send/scheduler jitter. Idle playback starts a fresh clock; brief
+queue gaps retain any audio still in flight. Hard interruptions discard locally queued
 audio; soft interruptions let it drain. Both report playback state to Dialt,
 and late audio for an interrupted response is ignored. `voice_ws` has no remote
 playback receipts or clear-buffer command: audio already sent to the actor cannot be recalled,
@@ -45,7 +47,8 @@ replay, to avoid repeating account or payment operations.
 Cancelled tools are skipped if still queued. An already running blocking
 vendor request cannot be undone; its result is not sent after cancellation.
 
-Tool results preserve the shared payload. Explicit negative verification or
+Tool results preserve the shared payload. The shared `UNVERIFIED` refusal
+(before any vendor operation) and explicit negative verification or
 payment results report `failed`; successful results report `succeeded` and
 `verified: true`. Generic errors report `unknown`, unverified: a write may have
 committed before its response or subsequent refresh failed. This conservative
@@ -68,6 +71,17 @@ instead of silently running a different configuration. Suppression can remove
 quiet caller words and reduce recognition accuracy, including in clean audio.
 Agent control lets the model enable or disable it during the call; it does
 not guarantee better benchmark results.
+
+Before a bench trial, verify the exact runtime key can start both tiers and
+receives `ready` with suppression disabled and agent control enabled. A disabled
+beta or server kill switch fails startup; the bridge does not silently remove
+this capability to make a call succeed. Do not put the key in an issue or PR.
+
+Lifecycle logs include connection open/close, duration, tier and startup state.
+Provider error logs include only `code` and `retryable`. Handler failures retain
+stack locations and exception class with the message redacted. These transport
+diagnostics do not log raw provider payloads, tool results, audio, transcripts
+or credentials; the shared Rory dispatcher's existing logging is unchanged.
 
 ## References and tests
 

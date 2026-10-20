@@ -177,6 +177,105 @@ def test_startup_rejection_or_mismatched_state_fails_closed(monkeypatch, ready):
     asyncio.run(scenario())
 
 
+def test_playback_clock_absorbs_send_cost_and_jitter_without_accumulating_drift(monkeypatch):
+    async def scenario():
+        clock = SimpleNamespace(now=100.0)
+        real_sleep = asyncio.sleep
+        sent = []
+
+        async def sleep(delay):
+            clock.now += delay + .001  # repeatable scheduler overshoot
+            await real_sleep(0)
+
+        class TimedActor(Actor):
+            async def send_bytes(self, audio):
+                clock.now += .003  # nonzero send cost must not accumulate
+                sent.append((clock.now, len(audio)))
+                await real_sleep(0)
+
+        monkeypatch.setattr(agent, "time", SimpleNamespace(monotonic=lambda: clock.now))
+        monkeypatch.setattr(agent, "asyncio", SimpleNamespace(Queue=asyncio.Queue, sleep=sleep))
+        playback = agent._Playback(TimedActor())
+        task = asyncio.create_task(playback.run())
+        try:
+            playback.append("first", b"\0" * 480000)  # exactly 10 seconds
+            await playback.queue.join()
+            assert 9.94 <= clock.now - 100 <= 9.95
+            total = 0
+            for at, size in sent:
+                total += size
+                assert total / 48000 - (at - 100) <= .08 + 1e-9
+
+            # A brief empty queue must not grant another full lead while
+            # previously sent audio is still in flight.
+            clock.now += .01
+            playback.append("first", b"\0" * 4800)
+            await playback.queue.join()
+            assert 10.04 <= clock.now - 100 <= 10.05
+
+            # True idle starts a fresh clock, without catch-up bursts or
+            # inheriting delay from the preceding response.
+            clock.now += 2
+            resumed = clock.now
+            playback.append("second", b"\0" * 48000)
+            await playback.queue.join()
+            assert .94 <= clock.now - resumed <= .95
+            assert sum(size for _, size in sent) == 532800
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("startup", [False, True])
+def test_provider_error_logs_only_safe_diagnostics(monkeypatch, caplog, startup):
+    async def scenario():
+        async def peer(ws):
+            await receive_json(ws)
+            if not startup:
+                await send(ws, READY)
+            await send(ws, {"type": "error", "code": "fixture_failure", "retryable": True,
+                            "detail": "private-payload", "api_key": "private-credential"})
+
+        with pytest.raises(RuntimeError, match="Dialt"):
+            await run_peer(monkeypatch, peer, Actor())
+
+    asyncio.run(scenario())
+    assert "code=fixture_failure retryable=True" in caplog.text
+    assert "private-payload" not in caplog.text
+    assert "private-credential" not in caplog.text
+
+
+def test_handler_logs_failure_stack_and_duration_without_exception_payload(monkeypatch, caplog):
+    from rory_dialt import web
+    from starlette.websockets import WebSocketState
+
+    class Socket:
+        client_state = WebSocketState.CONNECTED
+
+        async def accept(self):
+            pass
+
+        async def close(self, *, code, reason):
+            assert code == 1011
+
+    payload = "private-credential-and-transcript"
+
+    async def fail(_actor):
+        raise ValueError(payload)
+
+    monkeypatch.setattr(web, "run_voice_ws_bot", fail)
+    caplog.set_level("INFO", logger="uvicorn.error")
+    with pytest.raises(RuntimeError, match="Candidate voice handler failed"):
+        asyncio.run(web.voice(Socket()))
+    assert "connection opened" in caplog.text
+    assert "connection closed duration_s=" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "Traceback" in caplog.text
+    assert "private-credential-and-transcript" not in caplog.text
+
+
 def test_tools_are_sequential_without_blocking_audio_and_report_failures(monkeypatch):
     async def scenario():
         actor = Actor()
@@ -453,6 +552,12 @@ def test_committed_write_errors_are_unknown_not_failed(monkeypatch, failure):
         async def peer(ws):
             await receive_json(ws)
             await send(ws, READY)
+            # This exact shared refusal occurs before any vendor write.
+            await send(ws, {"type": "tool_call", "id": "unverified", "name": "set_paperless_billing", "args": {"enabled": True}})
+            refused = await receive_json(ws)
+            assert refused["outcome"] == "failed" and refused["verified"] is False
+            assert refused["content"] == agent.UNVERIFIED
+            assert committed == []
             for call_id, postal, expected in (("wrong", "99999", "failed"), ("right", "60614", "succeeded")):
                 await send(ws, {"type": "tool_call", "id": call_id, "name": "verify_caller",
                                 "args": {"account_number": "4417-88231", "name_on_account": "Jane Smith", "second_factor": postal}})

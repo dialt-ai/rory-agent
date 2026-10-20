@@ -13,7 +13,8 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+test = ["pytest>=8.0"]
+dev = [{ include-group = "test" }]
 
 [tool.uv.sources]
 rory-core = { workspace = true }

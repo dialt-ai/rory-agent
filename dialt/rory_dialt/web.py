@@ -1,5 +1,7 @@
 """The benchmark's health probe and PCM16/24 kHz mono voice_ws endpoint."""
 
+import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
@@ -18,6 +20,7 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="rory-dialt", version="0.1.0", lifespan=_lifespan)
+logger = logging.getLogger("uvicorn.error")
 
 
 @app.get("/health")
@@ -28,12 +31,21 @@ async def health() -> dict[str, str]:
 @app.websocket("/voice")
 async def voice(websocket: WebSocket) -> None:
     await websocket.accept()
+    started = time.monotonic()
+    logger.info("Dialt /voice connection opened")
     try:
         await run_voice_ws_bot(websocket)
-    except Exception:
+    except Exception as exc:
+        # Preserve stack locations and exception class, never the exception's
+        # payload (which may contain a provider response or a credential).
+        logger.exception("Dialt /voice handler failed", exc_info=(
+            RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__,
+        ))
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close(code=1011, reason="Candidate voice handler failed")
-        raise
+        raise RuntimeError("Candidate voice handler failed") from None
     else:
         if websocket.client_state == WebSocketState.CONNECTED:
             await websocket.close(code=1000)
+    finally:
+        logger.info("Dialt /voice connection closed duration_s=%.3f", time.monotonic() - started)
